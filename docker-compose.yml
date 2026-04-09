@@ -1,0 +1,215 @@
+version: "3.9"
+
+# ─────────────────────────────────────────────
+#  Distributed LLM Inference Engine
+#  Phase 1: Docker Compose — all services
+# ─────────────────────────────────────────────
+
+networks:
+  llm-net:
+    driver: bridge
+
+volumes:
+  llm-weights:      # Ollama model weights — persists across restarts
+  monitoring-data:  # Prometheus TSDB — 15-day retention
+  grafana-data:     # Grafana dashboards and settings
+
+services:
+
+  # ── 1. Ollama — LLM runtime ────────────────
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    volumes:
+      - llm-weights:/root/.ollama
+    ports:
+      - "11434:11434"
+    networks:
+      - llm-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    environment:
+      - OLLAMA_NUM_PARALLEL=4      # concurrent inference slots
+      - OLLAMA_MAX_LOADED_MODELS=1
+    deploy:
+      resources:
+        limits:
+          memory: 9G              # reserve rest for Ray + OS
+
+  # Pull model on first run (idempotent)
+  ollama-pull:
+    image: ollama/ollama:latest
+    container_name: ollama-pull
+    entrypoint: >
+      sh -c "sleep 10 && ollama pull llama3:8b-instruct-q4_K_M && echo 'Model ready'"
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+    networks:
+      - llm-net
+    depends_on:
+      ollama:
+        condition: service_healthy
+    restart: "no"
+
+  # ── 2. Ray Head Node ───────────────────────
+  ray-head:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.ray
+    container_name: ray-head
+    command: >
+      ray start --head
+        --port=6379
+        --dashboard-host=0.0.0.0
+        --dashboard-port=8265
+        --num-cpus=2
+        --block
+    ports:
+      - "6379:6379"    # Ray GCS
+      - "8265:8265"    # Ray dashboard
+      - "8001:8001"    # Ray Serve (internal API)
+    networks:
+      - llm-net
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+      - RAY_DISABLE_MEMORY_MONITOR=1
+    healthcheck:
+      test: ["CMD", "ray", "status"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+
+  # ── 3. Ray Workers ─────────────────────────
+  ray-worker-1:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.ray
+    container_name: ray-worker-1
+    command: >
+      ray start
+        --address=ray-head:6379
+        --num-cpus=2
+        --block
+    networks:
+      - llm-net
+    depends_on:
+      ray-head:
+        condition: service_healthy
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+      - WORKER_ID=1
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+
+  ray-worker-2:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.ray
+    container_name: ray-worker-2
+    command: >
+      ray start
+        --address=ray-head:6379
+        --num-cpus=2
+        --block
+    networks:
+      - llm-net
+    depends_on:
+      ray-head:
+        condition: service_healthy
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+      - WORKER_ID=2
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+
+  # ── 4. FastAPI Gateway ─────────────────────
+  gateway:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.gateway
+    container_name: gateway
+    ports:
+      - "8000:8000"
+    networks:
+      - llm-net
+    depends_on:
+      ray-head:
+        condition: service_healthy
+      ollama:
+        condition: service_healthy
+    environment:
+      - RAY_ADDRESS=ray://ray-head:6379
+      - OLLAMA_HOST=http://ollama:11434
+      - RATE_LIMIT_RPM=60
+      - MAX_TOKENS_DEFAULT=512
+      - LOG_LEVEL=info
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  # ── 5. Prometheus ──────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.51.0
+    container_name: prometheus
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - monitoring-data:/prometheus
+    ports:
+      - "9090:9090"
+    networks:
+      - llm-net
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=15d"
+      - "--web.enable-lifecycle"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:9090/-/healthy"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # ── 6. Grafana ─────────────────────────────
+  grafana:
+    image: grafana/grafana:10.4.0
+    container_name: grafana
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "3000:3000"
+    networks:
+      - llm-net
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH=/var/lib/grafana/dashboards/inference.json
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:3000/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5

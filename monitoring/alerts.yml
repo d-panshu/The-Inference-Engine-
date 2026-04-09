@@ -1,0 +1,57 @@
+groups:
+  - name: llm_inference_alerts
+    rules:
+
+      - alert: HighTTFT
+        expr: histogram_quantile(0.99, rate(llm_inference_ttft_seconds_bucket[5m])) > 10
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "P99 TTFT above 10s"
+          description: "99th percentile time-to-first-token is {{ $value }}s. Check model load or queue depth."
+
+      - alert: QueueDepthHigh
+        expr: llm_queue_depth > 12
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Inference queue nearly full"
+          description: "Queue depth is {{ $value }} (max 16). Requests will start getting 429s."
+
+      - alert: QueueFull
+        expr: llm_queue_depth >= 16
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "Inference queue FULL — clients receiving 429"
+          description: "Queue depth hit {{ $value }}. Scale up workers or reduce load."
+
+      - alert: GatewayDown
+        expr: up{job="gateway"} == 0
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "Gateway is down"
+          description: "FastAPI gateway is not responding to Prometheus scrapes."
+
+      - alert: HighMemoryPressure
+        expr: llm_memory_usage_bytes > 12 * 1024 * 1024 * 1024
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Memory usage above 12 GB"
+          description: "Used: {{ $value | humanize1024 }}. Risk of OOM on 16GB system."
+
+      - alert: KVCacheNearlyFull
+        expr: llm_kv_cache_utilization_ratio > 0.85
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "KV cache above 85% utilisation"
+          description: "At {{ $value | humanizePercentage }}. New requests may be rejected."

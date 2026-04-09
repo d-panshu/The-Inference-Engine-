@@ -1,0 +1,23 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir \
+    ray[serve]==2.10.0 \
+    vllm==0.4.0 \
+    torch==2.2.1 --index-url https://download.pytorch.org/whl/cpu \
+    prometheus-client==0.20.0 \
+    httpx==0.27.0 \
+    ollama==0.1.8
+
+COPY inference/ ./inference/
+COPY ray_cluster/ ./ray_cluster/
+COPY monitoring/metrics.py ./monitoring/metrics.py
+
+ENV PYTHONUNBUFFERED=1
+ENV RAY_DISABLE_MEMORY_MONITOR=1
